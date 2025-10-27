@@ -344,37 +344,11 @@ def _parse_listing(year: int) -> List[Paper]:
     return papers
 
 
-def _render_progress(
-    completed: int,
-    total: int,
-    *,
-    prefix: str = "",
-    end: str = "\n",
-) -> None:
-    """Render a simple textual progress indicator to ``stderr``."""
-
-    if total <= 0:
-        return
-
-    percent = int((completed / total) * 100)
-    bar_length = 20
-    filled = int(bar_length * completed / total)
-    bar = "#" * filled + "-" * (bar_length - filled)
-
-    sys.stderr.write(
-        f"\r{prefix}: [{bar}] {completed}/{total} ({percent:3d}%)"
-    )
-    if completed >= total:
-        sys.stderr.write(end)
-    sys.stderr.flush()
-
-
 def scrape(
     year: int,
     limit: Optional[int] = None,
     fetch_abstracts: bool = True,
     fetch_arxiv: bool = True,
-    show_progress: bool = False,
 ) -> List[Paper]:
     """Scrape NeurIPS papers for *year*.
 
@@ -389,8 +363,6 @@ def scrape(
         Whether to fetch abstract text for each paper.
     fetch_arxiv:
         Whether to attempt to enrich papers with arXiv metadata.
-    show_progress:
-        Whether to display a progress indicator while fetching optional metadata.
     """
 
     papers = _parse_listing(year)
@@ -398,14 +370,8 @@ def scrape(
         papers = papers[:limit]
 
     if fetch_abstracts or fetch_arxiv:
-        total = len(papers)
-        use_progress = show_progress and sys.stderr.isatty()
-        for index, paper in enumerate(papers, start=1):
+        for paper in papers:
             _populate_additional_details(paper, fetch_abstracts, fetch_arxiv)
-            if use_progress:
-                _render_progress(index, total, prefix="Fetching details", end="\n")
-        if use_progress:
-            sys.stderr.flush()
 
     return papers
 
@@ -430,11 +396,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip attempting to link arXiv entries for each paper",
     )
     parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable the progress indicator while fetching paper details",
-    )
-    parser.add_argument(
         "--output",
         type=str,
         default="-",
@@ -453,7 +414,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             limit=args.limit,
             fetch_abstracts=not args.skip_abstracts,
             fetch_arxiv=not args.skip_arxiv,
-            show_progress=not args.no_progress,
         )
     except requests.HTTPError as exc:
         print(f"Failed to fetch NeurIPS {args.year} listing: {exc}", file=sys.stderr)
