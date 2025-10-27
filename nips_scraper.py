@@ -15,6 +15,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from typing import Iterable, List, Optional
@@ -36,6 +37,8 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 REQUEST_TIMEOUT = 30  # seconds
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass
@@ -68,11 +71,34 @@ class Paper:
     arxiv: Optional[ArxivMetadata] = None
 
 
+def _request_with_retries(url: str) -> requests.Response:
+    """Perform a GET request with retry logic for transient failures."""
+
+    headers = {"User-Agent": USER_AGENT}
+    last_exception: Optional[requests.RequestException] = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response
+        except requests.HTTPError:
+            # HTTP status errors are unlikely to be transient; re-raise immediately.
+            raise
+        except requests.RequestException as exc:  # pragma: no cover - network issue
+            last_exception = exc
+            if attempt >= MAX_RETRIES:
+                raise
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    assert last_exception is not None  # pragma: no cover - defensive guard
+    raise last_exception
+
+
 def _get_soup(url: str) -> BeautifulSoup:
     """Fetch *url* and return a BeautifulSoup instance."""
 
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    response = _request_with_retries(url)
     return BeautifulSoup(response.text, "html.parser")
 
 
@@ -214,8 +240,7 @@ def _fetch_arxiv_metadata_by_id(identifier: str) -> Optional[ArxivMetadata]:
     """Fetch arXiv metadata for a specific identifier."""
 
     url = f"{ARXIV_API_URL}?id_list={quote(identifier)}"
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    response = _request_with_retries(url)
 
     root = ET.fromstring(response.text)
     entry = root.find("{http://www.w3.org/2005/Atom}entry")
@@ -232,8 +257,7 @@ def _search_arxiv_metadata(title: str, authors: List[str]) -> Optional[ArxivMeta
         query += f' AND au:"{authors[0]}"'
 
     url = f"{ARXIV_API_URL}?search_query={quote(query)}&start=0&max_results=5"
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    response = _request_with_retries(url)
 
     root = ET.fromstring(response.text)
     entries = root.findall("{http://www.w3.org/2005/Atom}entry")
@@ -344,11 +368,37 @@ def _parse_listing(year: int) -> List[Paper]:
     return papers
 
 
+def _render_progress(
+    completed: int,
+    total: int,
+    *,
+    prefix: str = "",
+    end: str = "\n",
+) -> None:
+    """Render a simple textual progress indicator to ``stderr``."""
+
+    if total <= 0:
+        return
+
+    percent = int((completed / total) * 100)
+    bar_length = 20
+    filled = int(bar_length * completed / total)
+    bar = "#" * filled + "-" * (bar_length - filled)
+
+    sys.stderr.write(
+        f"\r{prefix}: [{bar}] {completed}/{total} ({percent:3d}%)"
+    )
+    if completed >= total:
+        sys.stderr.write(end)
+    sys.stderr.flush()
+
+
 def scrape(
     year: int,
     limit: Optional[int] = None,
     fetch_abstracts: bool = True,
     fetch_arxiv: bool = True,
+    show_progress: bool = False,
 ) -> List[Paper]:
     """Scrape NeurIPS papers for *year*.
 
@@ -363,6 +413,8 @@ def scrape(
         Whether to fetch abstract text for each paper.
     fetch_arxiv:
         Whether to attempt to enrich papers with arXiv metadata.
+    show_progress:
+        Whether to display a progress indicator while fetching optional metadata.
     """
 
     papers = _parse_listing(year)
@@ -370,8 +422,14 @@ def scrape(
         papers = papers[:limit]
 
     if fetch_abstracts or fetch_arxiv:
-        for paper in papers:
+        total = len(papers)
+        use_progress = show_progress and sys.stderr.isatty()
+        for index, paper in enumerate(papers, start=1):
             _populate_additional_details(paper, fetch_abstracts, fetch_arxiv)
+            if use_progress:
+                _render_progress(index, total, prefix="Fetching details", end="\n")
+        if use_progress:
+            sys.stderr.flush()
 
     return papers
 
@@ -396,6 +454,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip attempting to link arXiv entries for each paper",
     )
     parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the progress indicator while fetching paper details",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="-",
@@ -414,6 +477,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             limit=args.limit,
             fetch_abstracts=not args.skip_abstracts,
             fetch_arxiv=not args.skip_arxiv,
+            show_progress=not args.no_progress,
         )
     except requests.HTTPError as exc:
         print(f"Failed to fetch NeurIPS {args.year} listing: {exc}", file=sys.stderr)
