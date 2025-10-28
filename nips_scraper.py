@@ -249,30 +249,66 @@ def _fetch_arxiv_metadata_by_id(identifier: str) -> Optional[ArxivMetadata]:
     return _parse_arxiv_entry(entry)
 
 
+def _tokenise_title_for_search(title: str) -> List[str]:
+    """Return a list of tokens suitable for constructing arXiv queries."""
+
+    cleaned = re.sub(r"[^0-9A-Za-z]+", " ", title)
+    tokens = [token for token in cleaned.split() if token]
+    # arXiv performs better with a small number of filters; keep the first few
+    return tokens[:8]
+
+
+def _iter_arxiv_search_entries(queries: Iterable[str]) -> Iterable[ET.Element]:
+    """Yield entries returned by executing *queries* against the arXiv API."""
+
+    seen_ids: set[str] = set()
+    for query in queries:
+        if not query:
+            continue
+        url = f"{ARXIV_API_URL}?search_query={quote(query)}&start=0&max_results=15"
+        response = _request_with_retries(url)
+        root = ET.fromstring(response.text)
+        for entry in root.findall("{http://www.w3.org/2005/Atom}entry"):
+            identifier = entry.findtext("{http://www.w3.org/2005/Atom}id", default="")
+            if identifier in seen_ids:
+                continue
+            seen_ids.add(identifier)
+            yield entry
+
+
 def _search_arxiv_metadata(title: str, authors: List[str]) -> Optional[ArxivMetadata]:
     """Search arXiv for a paper that best matches the given title and authors."""
 
-    query = f'ti:"{title}"'
-    if authors:
-        query += f' AND au:"{authors[0]}"'
+    lead_author = authors[0] if authors else ""
+    author_token = lead_author.split()[0] if lead_author else ""
 
-    url = f"{ARXIV_API_URL}?search_query={quote(query)}&start=0&max_results=5"
-    response = _request_with_retries(url)
+    queries: List[str] = []
+    # Try exact phrase matches first, optionally constrained by the full lead author name.
+    if title and lead_author:
+        queries.append(f'ti:"{title}" AND au:"{lead_author}"')
+    if title:
+        queries.append(f'ti:"{title}"')
 
-    root = ET.fromstring(response.text)
-    entries = root.findall("{http://www.w3.org/2005/Atom}entry")
-    if not entries:
-        return None
+    # Fall back to conjunctions of individual title tokens which allows the API to
+    # match when punctuation or accents differ between the sources.
+    tokens = _tokenise_title_for_search(title)
+    if tokens:
+        token_query = " AND ".join(f"ti:{token}" for token in tokens)
+        if author_token:
+            queries.append(f"{token_query} AND au:{author_token}")
+        queries.append(token_query)
 
     best_entry: Optional[ET.Element] = None
     best_score = 0.0
-    for entry in entries:
+    for entry in _iter_arxiv_search_entries(queries):
         title_element = entry.find("{http://www.w3.org/2005/Atom}title")
         candidate_title = title_element.text if title_element is not None else ""
         score = _title_similarity(title, candidate_title)
         if score > best_score:
             best_entry = entry
             best_score = score
+            if best_score >= 0.92:
+                break
 
     if best_entry is None or best_score < 0.8:
         return None
@@ -280,10 +316,15 @@ def _search_arxiv_metadata(title: str, authors: List[str]) -> Optional[ArxivMeta
     return _parse_arxiv_entry(best_entry)
 
 
-def _resolve_arxiv_metadata(paper: Paper, soup: BeautifulSoup) -> Optional[ArxivMetadata]:
+def _resolve_arxiv_metadata(
+    paper: Paper, soup: Optional[BeautifulSoup]
+) -> Optional[ArxivMetadata]:
     """Resolve arXiv metadata for a paper using page hints and API lookups."""
 
-    identifier = _extract_arxiv_identifier(soup)
+    identifier: Optional[str] = None
+    if soup is not None:
+        identifier = _extract_arxiv_identifier(soup)
+
     if identifier:
         try:
             metadata = _fetch_arxiv_metadata_by_id(identifier)
@@ -314,15 +355,20 @@ def _populate_additional_details(paper: Paper, fetch_abstract: bool, fetch_arxiv
     if not (fetch_abstract or fetch_arxiv):
         return
 
+    soup: Optional[BeautifulSoup] = None
     try:
         soup = _get_soup(paper.paper_url)
-    except requests.HTTPError:
-        return
+    except requests.HTTPError as exc:
+        # Leave a note if we expected to capture the abstract but could not fetch the page.
+        if fetch_abstract:
+            print(
+                f"Failed to fetch abstract page {paper.paper_url}: {exc}",
+                file=sys.stderr,
+            )
     except requests.RequestException as exc:  # pragma: no cover - network issue
         print(f"Failed to fetch abstract page {paper.paper_url}: {exc}", file=sys.stderr)
-        return
 
-    if fetch_abstract:
+    if fetch_abstract and soup is not None:
         paper.abstract = _extract_abstract_from_soup(soup)
 
     if fetch_arxiv:
