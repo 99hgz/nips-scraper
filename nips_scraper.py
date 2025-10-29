@@ -1,13 +1,14 @@
-"""Scrape NeurIPS (NIPS) accepted papers for a given year.
+"""Scrape major machine learning and NLP conference proceedings.
 
-This script fetches the accepted papers listed on the NeurIPS
-proceedings website (https://papers.neurips.cc) and extracts metadata
-including the paper title, authors, track, abstract URL, PDF URL, and
-optionally arXiv metadata when a matching entry can be found.
+The scraper currently understands NeurIPS (https://papers.neurips.cc)
+and ACL Anthology events (https://aclanthology.org) including ACL,
+NAACL, and EMNLP listings, extracting paper metadata including the
+title, authors, track, abstract URL, PDF URL, and optionally arXiv
+metadata when a matching entry can be found.
 
 Example
 -------
-python nips_scraper.py --year 2023 --limit 5 --output papers.json
+python nips_scraper.py --conference acl --year 2023 --limit 5 --output papers.json
 """
 from __future__ import annotations
 
@@ -25,8 +26,11 @@ import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://papers.neurips.cc"
-LISTING_PATH_TEMPLATE = "/paper_files/paper/{year}"
+NEURIPS_BASE_URL = "https://papers.neurips.cc"
+NEURIPS_LISTING_PATH_TEMPLATE = "/paper_files/paper/{year}"
+ACL_BASE_URL = "https://aclanthology.org"
+ACL_EVENT_PATH_TEMPLATE = "/events/{event}-{year}/"
+ACL_STYLE_CONFERENCES = {"acl", "naacl", "emnlp"}
 ABSTRACT_PATH_PATTERN = re.compile(
     r"/paper_files/paper/(?P<year>\d{4})/hash/(?P<hash>[0-9a-f]+)-Abstract-(?P<section>[^.]+)\.html"
 )
@@ -127,7 +131,16 @@ def _extract_authors(container: BeautifulSoup) -> List[str]:
 def _extract_abstract_from_soup(soup: BeautifulSoup) -> Optional[str]:
     """Retrieve the abstract text from a parsed abstract page."""
 
-    header = soup.find(lambda tag: tag.name in {"h3", "h4"} and "abstract" in tag.get_text(strip=True).lower())
+    card = soup.find("div", class_=lambda value: isinstance(value, str) and "acl-abstract" in value)
+    if card:
+        text = card.get_text(" ", strip=True)
+        if text:
+            return text
+
+    header = soup.find(
+        lambda tag: tag.name in {"h2", "h3", "h4", "h5", "h6"}
+        and "abstract" in tag.get_text(strip=True).lower()
+    )
     if not header:
         return None
 
@@ -375,10 +388,10 @@ def _populate_additional_details(paper: Paper, fetch_abstract: bool, fetch_arxiv
         paper.arxiv = _resolve_arxiv_metadata(paper, soup)
 
 
-def _parse_listing(year: int) -> List[Paper]:
+def _parse_neurips_listing(year: int) -> List[Paper]:
     """Parse the listing page for *year* and return paper metadata."""
 
-    listing_url = urljoin(BASE_URL, LISTING_PATH_TEMPLATE.format(year=year))
+    listing_url = urljoin(NEURIPS_BASE_URL, NEURIPS_LISTING_PATH_TEMPLATE.format(year=year))
     soup = _get_soup(listing_url)
 
     papers: List[Paper] = []
@@ -393,9 +406,9 @@ def _parse_listing(year: int) -> List[Paper]:
 
         section = match.group("section")
         paper_hash = match.group("hash")
-        abstract_url = urljoin(BASE_URL, link["href"])
+        abstract_url = urljoin(NEURIPS_BASE_URL, link["href"])
         pdf_url = urljoin(
-            BASE_URL,
+            NEURIPS_BASE_URL,
             f"/paper_files/paper/{year}/file/{paper_hash}-Paper-{section}.pdf",
         )
 
@@ -410,6 +423,81 @@ def _parse_listing(year: int) -> List[Paper]:
                 abstract=None,
             )
         )
+
+    return papers
+
+
+def _parse_acl_listing(year: int, event: str) -> List[Paper]:
+    """Parse an ACL Anthology event page for *year* and return paper metadata."""
+
+    event_slug = event.strip().lower()
+    if event_slug not in ACL_STYLE_CONFERENCES:
+        raise ValueError(f"Unsupported ACL Anthology event '{event}'")
+    event_path = ACL_EVENT_PATH_TEMPLATE.format(event=event_slug, year=year)
+    listing_url = urljoin(ACL_BASE_URL, event_path)
+    soup = _get_soup(listing_url)
+
+    papers: List[Paper] = []
+    section_selector = f"div[id^='{year}{event_slug}-']"
+    for section in soup.select(section_selector):
+        header_link = None
+        header = section.find("h4")
+        if header:
+            header_links = header.find_all("a")
+            if header_links:
+                header_link = header_links[-1]
+        track = (
+            header_link.get_text(" ", strip=True)
+            if header_link
+            else section.get("id", event_slug.upper())
+        )
+
+        for entry in section.find_all("p", class_="d-sm-flex align-items-stretch"):
+            spans = entry.find_all("span")
+            if len(spans) < 2:
+                continue
+
+            content_span = spans[-1]
+            title_container = content_span.find("strong")
+            if title_container is None:
+                continue
+            title_anchor = title_container.find("a", href=True)
+            if title_anchor is None:
+                continue
+
+            title = title_anchor.get_text(" ", strip=True)
+            paper_url = urljoin(ACL_BASE_URL, title_anchor["href"])
+
+            pdf_url: Optional[str] = None
+            button_span = entry.find("span", class_="list-button-row")
+            if button_span:
+                for anchor in button_span.find_all("a", href=True):
+                    text = anchor.get_text(" ", strip=True).lower()
+                    href = anchor["href"].strip()
+                    if "pdf" in text or href.lower().endswith(".pdf"):
+                        pdf_url = urljoin(ACL_BASE_URL, href)
+                        break
+            if not pdf_url:
+                pdf_url = f"{paper_url.rstrip('/')}.pdf"
+
+            author_links = [
+                anchor
+                for anchor in content_span.find_all("a", href=True)
+                if anchor is not title_anchor and "/people/" in anchor["href"]
+            ]
+            authors = [anchor.get_text(" ", strip=True) for anchor in author_links]
+
+            papers.append(
+                Paper(
+                    year=year,
+                    title=title,
+                    authors=authors,
+                    track=track,
+                    paper_url=paper_url,
+                    pdf_url=pdf_url,
+                    abstract=None,
+                )
+            )
 
     return papers
 
@@ -441,17 +529,21 @@ def _render_progress(
 
 def scrape(
     year: int,
+    conference: str = "neurips",
     limit: Optional[int] = None,
     fetch_abstracts: bool = True,
     fetch_arxiv: bool = True,
     show_progress: bool = False,
 ) -> List[Paper]:
-    """Scrape NeurIPS papers for *year*.
+    """Scrape conference papers for *year*.
 
     Parameters
     ----------
     year:
         The conference year to fetch.
+    conference:
+        Which conference to scrape. Supported values are ``"neurips"``,
+        ``"acl"``, ``"naacl"``, and ``"emnlp"``.
     limit:
         Optional maximum number of papers to return. The papers appear in the
         same order as listed on the website.
@@ -463,7 +555,14 @@ def scrape(
         Whether to display a progress indicator while fetching optional metadata.
     """
 
-    papers = _parse_listing(year)
+    normalised_conference = conference.strip().lower()
+
+    if normalised_conference == "neurips":
+        papers = _parse_neurips_listing(year)
+    elif normalised_conference in ACL_STYLE_CONFERENCES:
+        papers = _parse_acl_listing(year, normalised_conference)
+    else:
+        raise ValueError(f"Unsupported conference '{conference}'")
     if limit is not None:
         papers = papers[:limit]
 
@@ -481,8 +580,15 @@ def scrape(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scrape NeurIPS accepted papers")
+    parser = argparse.ArgumentParser(description="Scrape accepted conference papers")
     parser.add_argument("--year", type=int, required=True, help="Conference year to scrape")
+    parser.add_argument(
+        "--conference",
+        type=str,
+        default="neurips",
+        choices=["neurips", "acl", "naacl", "emnlp"],
+        help="Which conference to scrape (default: neurips)",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -520,16 +626,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         papers = scrape(
             args.year,
+            conference=args.conference,
             limit=args.limit,
             fetch_abstracts=not args.skip_abstracts,
             fetch_arxiv=not args.skip_arxiv,
             show_progress=not args.no_progress,
         )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except requests.HTTPError as exc:
-        print(f"Failed to fetch NeurIPS {args.year} listing: {exc}", file=sys.stderr)
+        print(
+            f"Failed to fetch {args.conference.upper()} {args.year} listing: {exc}",
+            file=sys.stderr,
+        )
         return 1
     except requests.RequestException as exc:  # pragma: no cover - network issue
-        print(f"Network error while fetching NeurIPS data: {exc}", file=sys.stderr)
+        print(
+            f"Network error while fetching {args.conference.upper()} data: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
     data = [asdict(paper) for paper in papers]
