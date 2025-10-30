@@ -1,14 +1,15 @@
 """Scrape major machine learning and NLP conference proceedings.
 
-The scraper currently understands NeurIPS (https://papers.neurips.cc)
-and ACL Anthology events (https://aclanthology.org) including ACL,
-NAACL, and EMNLP listings, extracting paper metadata including the
-title, authors, track, abstract URL, PDF URL, and optionally arXiv
-metadata when a matching entry can be found.
+The scraper currently understands NeurIPS (https://papers.neurips.cc),
+ICLR (https://openreview.net), and ACL Anthology events
+(https://aclanthology.org) including ACL, NAACL, and EMNLP listings,
+extracting paper metadata including the title, authors, track, abstract
+URL, PDF URL, and optionally arXiv metadata when a matching entry can be
+found.
 
 Example
 -------
-python nips_scraper.py --conference acl --year 2023 --limit 5 --output papers.json
+python nips_scraper.py --conference iclr --year 2023 --limit 5 --output papers.json
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote, urljoin
 import xml.etree.ElementTree as ET
 
@@ -31,6 +32,9 @@ NEURIPS_LISTING_PATH_TEMPLATE = "/paper_files/paper/{year}"
 ACL_BASE_URL = "https://aclanthology.org"
 ACL_EVENT_PATH_TEMPLATE = "/events/{event}-{year}/"
 ACL_STYLE_CONFERENCES = {"acl", "naacl", "emnlp"}
+OPENREVIEW_API_NOTES_URL = "https://api.openreview.net/notes"
+OPENREVIEW_API_NOTES_SEARCH_URL = "https://api.openreview.net/notes/search"
+OPENREVIEW_BASE_URL = "https://openreview.net"
 ABSTRACT_PATH_PATTERN = re.compile(
     r"/paper_files/paper/(?P<year>\d{4})/hash/(?P<hash>[0-9a-f]+)-Abstract-(?P<section>[^.]+)\.html"
 )
@@ -75,15 +79,42 @@ class Paper:
     arxiv: Optional[ArxivMetadata] = None
 
 
-def _request_with_retries(url: str) -> requests.Response:
+def _request_with_retries(
+    url: str,
+    params: Optional[dict[str, str]] = None,
+    *,
+    method: str = "GET",
+    json_body: Optional[dict[str, Any]] = None,
+) -> requests.Response:
     """Perform a GET request with retry logic for transient failures."""
 
-    headers = {"User-Agent": USER_AGENT}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
+    }
     last_exception: Optional[requests.RequestException] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 429:
+                if attempt >= MAX_RETRIES:
+                    response.raise_for_status()
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else RETRY_DELAY_SECONDS
+                except ValueError:
+                    delay = RETRY_DELAY_SECONDS
+                time.sleep(delay)
+                continue
+
             response.raise_for_status()
             return response
         except requests.HTTPError:
@@ -365,7 +396,9 @@ def _resolve_arxiv_metadata(
 def _populate_additional_details(paper: Paper, fetch_abstract: bool, fetch_arxiv: bool) -> None:
     """Fetch optional abstract text and arXiv metadata for *paper*."""
 
-    if not (fetch_abstract or fetch_arxiv):
+    needs_abstract = fetch_abstract and not paper.abstract
+
+    if not (needs_abstract or fetch_arxiv):
         return
 
     soup: Optional[BeautifulSoup] = None
@@ -373,7 +406,7 @@ def _populate_additional_details(paper: Paper, fetch_abstract: bool, fetch_arxiv
         soup = _get_soup(paper.paper_url)
     except requests.HTTPError as exc:
         # Leave a note if we expected to capture the abstract but could not fetch the page.
-        if fetch_abstract:
+        if needs_abstract:
             print(
                 f"Failed to fetch abstract page {paper.paper_url}: {exc}",
                 file=sys.stderr,
@@ -381,7 +414,7 @@ def _populate_additional_details(paper: Paper, fetch_abstract: bool, fetch_arxiv
     except requests.RequestException as exc:  # pragma: no cover - network issue
         print(f"Failed to fetch abstract page {paper.paper_url}: {exc}", file=sys.stderr)
 
-    if fetch_abstract and soup is not None:
+    if needs_abstract and soup is not None:
         paper.abstract = _extract_abstract_from_soup(soup)
 
     if fetch_arxiv:
@@ -502,6 +535,218 @@ def _parse_acl_listing(year: int, event: str) -> List[Paper]:
     return papers
 
 
+def _iter_openreview_notes(invitation: str) -> Iterable[dict[str, Any]]:
+    """Yield OpenReview notes for *invitation* using paginated requests."""
+
+    offset = 0
+    limit = 200
+
+    while True:
+        params = {
+            "invitation": invitation,
+            "offset": str(offset),
+            "limit": str(limit),
+        }
+        response = _request_with_retries(OPENREVIEW_API_NOTES_URL, params=params)
+        payload = response.json()
+        notes = payload.get("notes", [])
+        if not notes:
+            break
+        for note in notes:
+            yield note
+        offset += len(notes)
+        if len(notes) < limit:
+            break
+
+
+def _search_openreview_notes(
+    query: str, *, sort: str = "tmdate:asc", page_size: int = 200
+) -> Iterable[dict[str, Any]]:
+    """Yield OpenReview notes that satisfy a Lucene *query* string."""
+
+    offset = 0
+    while True:
+        payload = {
+            "query": query,
+            "limit": page_size,
+            "offset": offset,
+            "details": "all",
+            "sort": sort,
+        }
+        response = _request_with_retries(
+            OPENREVIEW_API_NOTES_SEARCH_URL,
+            method="POST",
+            json_body=payload,
+        )
+        data = response.json()
+        notes = data.get("notes", [])
+        if not notes:
+            break
+        for note in notes:
+            yield note
+        offset += len(notes)
+        if offset >= data.get("count", 0):
+            break
+
+
+def _normalise_iclr_track(venue: str, year: int) -> str:
+    """Extract a human readable track label from an ICLR venue string."""
+
+    if not venue:
+        return "Conference"
+
+    prefix = f"ICLR {year}"
+    lower_venue = venue.lower()
+    if lower_venue.startswith(prefix.lower()):
+        suffix = venue[len(prefix) :].strip()
+        suffix = suffix.strip("- ")
+        if suffix.startswith("(") and suffix.endswith(")"):
+            suffix = suffix[1:-1].strip()
+        if suffix:
+            return suffix.title()
+        return "Conference"
+
+    return venue
+
+
+def _iclr_track_from_decision(decision: str) -> str:
+    """Derive a track label from an ICLR decision string."""
+
+    if not decision:
+        return "Conference"
+
+    match = re.search(r"accept\s*\(([^)]+)\)", decision, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).replace("_", " ").strip().title() or "Conference"
+
+    if "accept" in decision.lower():
+        return "Conference"
+
+    return decision.strip().title() or "Conference"
+
+
+def _build_iclr_decision_map(year: int) -> Dict[str, str]:
+    """Return a mapping from forum IDs to decision strings for ICLR."""
+
+    invitation = f"ICLR.cc/{year}/Conference/Paper.*"
+    decisions: Dict[str, str] = {}
+    for note in _iter_openreview_notes(invitation):
+        invitation_name = note.get("invitation", "")
+        if not invitation_name.endswith("/-/Decision"):
+            continue
+
+        forum = note.get("forum")
+        if not forum:
+            continue
+
+        content = note.get("content", {})
+        decision = (content.get("decision") or "").strip()
+        if decision:
+            decisions[forum] = decision
+
+    return decisions
+
+
+def _iclr_note_to_paper(
+    year: int, note: dict[str, Any], *, decision_map: Dict[str, str]
+) -> Optional[Paper]:
+    """Convert an OpenReview note into a :class:`Paper` if it is accepted."""
+
+    content = note.get("content", {})
+    venue = (content.get("venue") or "").strip()
+    decision_text = (content.get("decision") or "").strip()
+
+    title = content.get("title", "").strip()
+    authors = [author.strip() for author in content.get("authors", []) if author.strip()]
+    forum = note.get("forum") or note.get("id")
+    if not forum or not title:
+        return None
+
+    pdf_path = content.get("pdf") or ""
+    pdf_url = urljoin(OPENREVIEW_BASE_URL, pdf_path)
+    paper_url = urljoin(OPENREVIEW_BASE_URL, f"/forum?id={forum}")
+
+    decision = decision_text
+    if not venue:
+        if not decision:
+            decision = decision_map.get(forum)
+
+        status = decision or ""
+    else:
+        status = venue
+
+    normalised = status.lower()
+    if "submitted" in normalised or "reject" in normalised or "withdraw" in normalised:
+        return None
+
+    if venue:
+        track = _normalise_iclr_track(venue, year)
+    else:
+        track = _iclr_track_from_decision(decision or "")
+    abstract = (content.get("abstract") or "").strip() or None
+
+    return Paper(
+        year=year,
+        title=title,
+        authors=authors,
+        track=track,
+        paper_url=paper_url,
+        pdf_url=pdf_url,
+        abstract=abstract,
+    )
+
+
+def _parse_iclr_listing(year: int) -> List[Paper]:
+    """Fetch accepted ICLR papers for *year* from OpenReview."""
+
+    invitation = f"ICLR.cc/{year}/Conference/-/Blind_Submission"
+    notes = list(_iter_openreview_notes(invitation))
+    notes.sort(key=lambda note: note.get("number", 0))
+
+    papers: List[Paper] = []
+    decision_map: Optional[Dict[str, str]] = None
+    for note in notes:
+        if decision_map is None:
+            content = note.get("content", {})
+            venue_present = (content.get("venue") or "").strip()
+            decision_inline = (content.get("decision") or "").strip()
+            if not venue_present and not decision_inline:
+                decision_map = _build_iclr_decision_map(year)
+
+        paper = _iclr_note_to_paper(year, note, decision_map=decision_map or {})
+        if paper is not None:
+            papers.append(paper)
+
+    if not papers:
+        search_queries = [f'content.venueid:"ICLR.cc/{year}/Conference"']
+        for track in ("Poster", "Spotlight", "Oral"):
+            search_queries.append(
+                f'content.venueid:"ICLR.cc/{year}/Conference/{track}"'
+            )
+            search_queries.append(f'content.venue:"ICLR {year} {track}"')
+        search_queries.append(f'content.venue:"ICLR {year}"')
+
+        seen_forums: Dict[str, Paper] = {}
+        for query in search_queries:
+            for note in _search_openreview_notes(query):
+                forum = note.get("forum") or note.get("id")
+                if not forum or forum in seen_forums:
+                    continue
+                paper = _iclr_note_to_paper(year, note, decision_map={})
+                if paper is not None:
+                    seen_forums[forum] = paper
+
+        papers = list(seen_forums.values())
+
+    if not papers:
+        raise ValueError(
+            "No accepted ICLR submissions were found via the published OpenReview feeds. "
+            "Check the year or try again later."
+        )
+
+    return papers
+
+
 def _render_progress(
     completed: int,
     total: int,
@@ -543,7 +788,7 @@ def scrape(
         The conference year to fetch.
     conference:
         Which conference to scrape. Supported values are ``"neurips"``,
-        ``"acl"``, ``"naacl"``, and ``"emnlp"``.
+        ``"iclr"``, ``"acl"``, ``"naacl"``, and ``"emnlp"``.
     limit:
         Optional maximum number of papers to return. The papers appear in the
         same order as listed on the website.
@@ -559,6 +804,8 @@ def scrape(
 
     if normalised_conference == "neurips":
         papers = _parse_neurips_listing(year)
+    elif normalised_conference == "iclr":
+        papers = _parse_iclr_listing(year)
     elif normalised_conference in ACL_STYLE_CONFERENCES:
         papers = _parse_acl_listing(year, normalised_conference)
     else:
@@ -586,7 +833,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--conference",
         type=str,
         default="neurips",
-        choices=["neurips", "acl", "naacl", "emnlp"],
+        choices=["neurips", "iclr", "acl", "naacl", "emnlp"],
         help="Which conference to scrape (default: neurips)",
     )
     parser.add_argument(
